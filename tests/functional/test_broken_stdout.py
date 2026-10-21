@@ -17,9 +17,11 @@ def setup_broken_stdout_test(
     # Call close() on stdout to cause a broken pipe.
     assert proc.stdout is not None
     proc.stdout.close()
-    returncode = proc.wait()
+    # Drain stderr before waiting: if the child writes more than the OS pipe
+    # buffer holds, waiting first deadlocks parent and child (seen on Windows).
     assert proc.stderr is not None
     stderr = proc.stderr.read().decode("utf-8")
+    returncode = proc.wait()
 
     expected_msg = "ERROR: Pipe to stdout was broken"
     if deprecated_python:

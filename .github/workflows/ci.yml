@@ -1,22 +1,30 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-    tags:
-      # Tags for all potential release numbers till 2030.
-      - "2[0-9].[0-3]" # 20.0 -> 29.3
-      - "2[0-9].[0-3].[0-9]+" # 20.0.0 -> 29.3.[0-9]+
-  pull_request:
-  schedule:
-    - cron: 0 0 * * MON # Run every Monday at 00:00 UTC
   workflow_dispatch:
     # allow manual runs on branches without a PR
+    inputs:
+      test-filter:
+        description: "Optional pytest selector; when set, only these tests run"
+        required: false
+        default: ""
 
 env:
   # The "FORCE_COLOR" variable, when set to 1,
   # tells Nox to colorize itself.
   FORCE_COLOR: "1"
+  # pyproject's pytest addopts has --color=yes, which glues ANSI codes onto the
+  # "N passed" summary lines; --color=no keeps the result counts plain text.
+  PYTEST_ADDOPTS: "--color=no"
+  # Newer git runs auto-maintenance detached in the background after commits; its
+  # transient .git/objects/maintenance.lock races scripttest's before/after file
+  # scan in the VCS functional tests (FileNotFoundError). Disable it for all git
+  # calls (these env vars survive the tests' isolated HOME/GIT_CONFIG_NOSYSTEM).
+  GIT_CONFIG_COUNT: "2"
+  GIT_CONFIG_KEY_0: maintenance.auto
+  GIT_CONFIG_VALUE_0: "false"
+  GIT_CONFIG_KEY_1: gc.auto
+  GIT_CONFIG_VALUE_1: "0"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -26,17 +34,21 @@ jobs:
   docs:
     name: docs
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
+          # "3.x" now resolves to CPython 3.15, which pip 24.3.1's vendored
+          # typing_extensions cannot import; 3.13 was "3.x" at release time.
+          python-version: "3.13"
       - run: pip install nox
       - run: nox -s docs
 
   determine-changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       tests: ${{ steps.filter.outputs.tests }}
       vendoring: ${{ steps.filter.outputs.vendoring }}
@@ -65,6 +77,7 @@ jobs:
   packaging:
     name: packaging
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
@@ -81,9 +94,37 @@ jobs:
       - run: nox -s build-release -- 99.9
       - run: pipx run check-manifest
 
+  release-dists:
+    name: release distributions
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # Build tooling resolved at pip 24.3.1's release date (2024-10-27) so the
+    # isolated build env gets setuptools 75.2.0, matching the published
+    # wheel's `Generator: setuptools (75.2.0)`. Same `python -m build` that
+    # `nox -s build-release` runs.
+    env:
+      PIP_INDEX_URL: "https://:2024-10-27T18:35:53Z@time-machines-pypi.sealsecurity.io/"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build tooling
+        run: python -m pip install build
+      - name: Build sdist and wheel
+        run: python -m build --outdir "${{ runner.temp }}/release-dist" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-package-distributions
+          path: ${{ runner.temp }}/release-dist/
+          if-no-files-found: error
+
   vendoring:
     name: vendoring
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     needs: [determine-changes]
     if: >-
@@ -103,6 +144,7 @@ jobs:
   tests-unix:
     name: tests / ${{ matrix.python.key || matrix.python }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
 
     needs: [packaging, determine-changes]
     if: >-
@@ -110,9 +152,10 @@ jobs:
       github.event_name != 'pull_request'
 
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-13, macos-latest]
+        # macos-13 is retired; macos-15-intel keeps the x86_64 macOS leg.
+        os: [ubuntu-latest, macos-15-intel, macos-latest]
         python:
           - "3.8"
           - "3.9"
@@ -133,6 +176,21 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install bzr
+          # Ubuntu 24.04's bzr is breezy's launcher embedding the system
+          # libpython; setup-python's LD_LIBRARY_PATH/PATH make it pick up the
+          # toolcache Python instead ("No module named 'breezy'"), so wrap it.
+          printf '#!/bin/sh\nexec env -u LD_LIBRARY_PATH PATH="/usr/bin:/bin:$PATH" /usr/bin/brz "$@"\n' | sudo tee /usr/local/bin/bzr > /dev/null
+          sudo chmod +x /usr/local/bin/bzr
+          bzr version --short
+          # The runner image's /etc/pip.conf sets break-system-packages = true,
+          # which leaks into the test venvs and disables the PEP 668 check
+          # that test_pep668.py::test_fails exercises.
+          sudo rm -f /etc/pip.conf
+          # The ubuntu-22.04 image upstream ran on shipped svn; 24.04 does not
+          # (tests/unit/test_vcs.py::test_ensure_svn_available asserts it on CI).
+          if ! which svn; then
+            sudo apt-get install subversion
+          fi
 
       - name: Install MacOS dependencies
         if: runner.os == 'macOS'
@@ -149,9 +207,10 @@ jobs:
       - name: Run unit tests
         run: >-
           nox -s test-${{ matrix.python.key || matrix.python }} --
-          -m unit
+          ${{ inputs.test-filter == '' && '-m unit' || inputs.test-filter }}
           --verbose --numprocesses auto --showlocals
       - name: Run integration tests
+        if: inputs.test-filter == ''
         run: >-
           nox -s test-${{ matrix.python.key || matrix.python }} --
           -m integration
@@ -161,6 +220,7 @@ jobs:
   tests-windows:
     name: tests / ${{ matrix.python }} / ${{ matrix.os }} / ${{ matrix.group }}
     runs-on: ${{ matrix.os }}-latest
+    timeout-minutes: 40
 
     needs: [packaging, determine-changes]
     if: >-
@@ -168,7 +228,7 @@ jobs:
       github.event_name != 'pull_request'
 
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         os: [Windows]
         python:
@@ -184,10 +244,24 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      # 3.13 is pinned to 3.13.0, the release current when pip 24.3.1 shipped:
+      # later 3.13.x patch releases changed nturl2path's UNC/trailing-slash
+      # handling, which test_path_to_url_win / test_ensure_quoted_url assert.
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python }}
+          python-version: ${{ matrix.python == '3.13' && '3.13.0' || matrix.python }}
           allow-prereleases: true
+
+      # The windows-2022 image upstream ran on shipped an svn client; the
+      # current image does not (test_vcs.py::test_ensure_svn_available
+      # asserts it on CI), so install SlikSvn and put it on PATH.
+      - name: Install Subversion
+        shell: pwsh
+        run: |
+          if (-not (Get-Command svn -ErrorAction SilentlyContinue)) {
+            choco install -y --no-progress sliksvn
+            "C:\Program Files\SlikSvn\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
 
       # We use C:\Temp (which is already available on the worker)
       # as a temporary directory for all of the tests because the
@@ -202,13 +276,13 @@ jobs:
         if: matrix.group == 1
         run: >-
           nox -s test-${{ matrix.python }} --
-          -m unit
+          ${{ inputs.test-filter == '' && '-m unit' || inputs.test-filter }}
           --verbose --numprocesses auto --showlocals
         env:
           TEMP: "C:\\Temp"
 
       - name: Run integration tests (group 1)
-        if: matrix.group == 1
+        if: matrix.group == 1 && inputs.test-filter == ''
         run: >-
           nox -s test-${{ matrix.python }} --
           -m integration -k "not test_install"
@@ -217,7 +291,7 @@ jobs:
           TEMP: "C:\\Temp"
 
       - name: Run integration tests (group 2)
-        if: matrix.group == 2
+        if: matrix.group == 2 && inputs.test-filter == ''
         run: >-
           nox -s test-${{ matrix.python }} --
           -m integration -k "test_install"
@@ -228,6 +302,7 @@ jobs:
   tests-zipapp:
     name: tests / zipapp
     runs-on: ubuntu-latest
+    timeout-minutes: 50
 
     needs: [packaging, determine-changes]
     if: >-
@@ -244,11 +319,22 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install bzr
+          # See tests-unix: wrap Ubuntu 24.04's bzr so it ignores the
+          # toolcache Python, drop the image's break-system-packages
+          # /etc/pip.conf, and restore svn that the 22.04 image shipped.
+          printf '#!/bin/sh\nexec env -u LD_LIBRARY_PATH PATH="/usr/bin:/bin:$PATH" /usr/bin/brz "$@"\n' | sudo tee /usr/local/bin/bzr > /dev/null
+          sudo chmod +x /usr/local/bin/bzr
+          bzr version --short
+          sudo rm -f /etc/pip.conf
+          if ! which svn; then
+            sudo apt-get install subversion
+          fi
 
       - run: pip install nox
 
       # Main check
       - name: Run integration tests
+        if: inputs.test-filter == ''
         run: >-
           nox -s test-3.10 --
           -m integration
@@ -267,8 +353,10 @@ jobs:
       - tests-windows
       - tests-zipapp
       - vendoring
+      - release-dists
 
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Decide whether the needed jobs succeeded or failed
