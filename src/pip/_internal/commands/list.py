@@ -1,7 +1,17 @@
+import contextlib
 import json
 import logging
 from optparse import Values
-from typing import TYPE_CHECKING, Generator, List, Optional, Sequence, Tuple, cast
+from typing import (
+    TYPE_CHECKING,
+    Generator,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    cast,
+)
 
 from pip._vendor.packaging.utils import canonicalize_name
 from pip._vendor.packaging.version import Version
@@ -134,9 +144,13 @@ class ListCommand(IndexGroupCommand):
         self.parser.insert_option_group(0, index_opts)
         self.parser.insert_option_group(0, self.cmd_opts)
 
-    def handle_pip_version_check(self, options: Values) -> None:
-        if options.outdated or options.uptodate:
-            super().handle_pip_version_check(options)
+    @contextlib.contextmanager
+    def pip_version_check(self, options: Values, args: List[str]) -> Iterator[None]:
+        if not (options.outdated or options.uptodate):
+            yield
+            return
+        with super().pip_version_check(options, args):
+            yield
 
     def _build_package_finder(
         self, options: Values, session: "PipSession"
