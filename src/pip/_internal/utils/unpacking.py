@@ -248,6 +248,20 @@ def untar_file(filename: str, location: str) -> None:
         tar.close()
 
 
+def is_symlink_target_in_tar(tar: tarfile.TarFile, tarinfo: tarfile.TarInfo) -> bool:
+    """Check if the file pointed to by the symbolic link is in the tar archive"""
+    linkname = os.path.join(os.path.dirname(tarinfo.name), tarinfo.linkname)
+
+    linkname = os.path.normpath(linkname)
+    linkname = linkname.replace("\\", "/")
+
+    try:
+        tar.getmember(linkname)
+        return True
+    except KeyError:
+        return False
+
+
 def _untar_without_filter(
     filename: str,
     location: str,
@@ -255,12 +269,20 @@ def _untar_without_filter(
     leading: bool,
 ) -> None:
     """Fallback for Python without tarfile.data_filter"""
+    # NOTE: This function can be removed once pip requires CPython >= 3.12.
+    # PEP 706 added tarfile.data_filter, made tarfile extraction operations more secure.
+    # This feature is fully supported from CPython 3.12 onward.
+    real_location = os.path.realpath(location)
     for member in tar.getmembers():
         fn = member.name
         if leading:
             fn = split_leading_dir(fn)[1]
         path = os.path.join(location, fn)
-        if not is_within_directory(location, path):
+        # Also resolve the symlinks extracted so far, so that no member can be
+        # written through a symlink leading outside of the target directory.
+        if not is_within_directory(location, path) or not is_within_directory(
+            real_location, os.path.realpath(path)
+        ):
             message = (
                 "The tar file ({}) has a file ({}) trying to install "
                 "outside target directory ({})"
@@ -269,6 +291,28 @@ def _untar_without_filter(
         if member.isdir():
             ensure_dir(path)
         elif member.issym():
+            if not is_symlink_target_in_tar(tar, member):
+                message = (
+                    "The tar file ({}) has a file ({}) trying to install "
+                    "outside target directory ({})"
+                )
+                raise InstallationError(
+                    message.format(filename, member.name, member.linkname)
+                )
+            # The link target must also resolve inside the target directory
+            # once the symlinks extracted so far are followed (for example
+            # "a/b/up" -> ".." makes "a/b/up/../.." point outside of it).
+            link_target = os.path.realpath(
+                os.path.join(os.path.dirname(path), member.linkname)
+            )
+            if not is_within_directory(real_location, link_target):
+                message = (
+                    "The tar file ({}) has a file ({}) trying to install "
+                    "outside target directory ({})"
+                )
+                raise InstallationError(
+                    message.format(filename, member.name, member.linkname)
+                )
             try:
                 tar._extract_member(member, path)
             except Exception as exc:

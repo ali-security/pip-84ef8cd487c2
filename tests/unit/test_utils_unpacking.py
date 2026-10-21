@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 import pytest
+from _pytest.monkeypatch import MonkeyPatch
 
 from pip._internal.exceptions import InstallationError
 from pip._internal.utils.unpacking import is_within_directory, untar_file, unzip_file
@@ -238,6 +239,302 @@ class TestUnpackArchives:
 
         with open(os.path.join(unpack_dir, "symlink.txt"), "rb") as f:
             assert f.read() == content
+
+    def test_unpack_normal_tar_link1_no_data_filter(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
+        """
+        Test unpacking a normal tar with file containing soft links, but no data_filter
+        """
+        if hasattr(tarfile, "data_filter"):
+            monkeypatch.delattr("tarfile.data_filter")
+
+        tar_filename = "test_tar_links_no_data_filter.tar"
+        tar_filepath = os.path.join(self.tempdir, tar_filename)
+
+        extract_path = os.path.join(self.tempdir, "extract_path")
+
+        with tarfile.open(tar_filepath, "w") as tar:
+            file_data = io.BytesIO(b"normal\n")
+            normal_file_tarinfo = tarfile.TarInfo(name="normal_file")
+            normal_file_tarinfo.size = len(file_data.getbuffer())
+            tar.addfile(normal_file_tarinfo, fileobj=file_data)
+
+            info = tarfile.TarInfo("normal_symlink")
+            info.type = tarfile.SYMTYPE
+            info.linkpath = "normal_file"
+            tar.addfile(info)
+
+        untar_file(tar_filepath, extract_path)
+
+        assert os.path.islink(os.path.join(extract_path, "normal_symlink"))
+
+        link_path = os.readlink(os.path.join(extract_path, "normal_symlink"))
+        assert link_path == "normal_file"
+
+        with open(os.path.join(extract_path, "normal_symlink"), "rb") as f:
+            assert f.read() == b"normal\n"
+
+    def test_unpack_normal_tar_link2_no_data_filter(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
+        """
+        Test unpacking a normal tar with file containing soft links, but no data_filter
+        """
+        if hasattr(tarfile, "data_filter"):
+            monkeypatch.delattr("tarfile.data_filter")
+
+        tar_filename = "test_tar_links_no_data_filter.tar"
+        tar_filepath = os.path.join(self.tempdir, tar_filename)
+
+        extract_path = os.path.join(self.tempdir, "extract_path")
+
+        with tarfile.open(tar_filepath, "w") as tar:
+            file_data = io.BytesIO(b"normal\n")
+            normal_file_tarinfo = tarfile.TarInfo(name="normal_file")
+            normal_file_tarinfo.size = len(file_data.getbuffer())
+            tar.addfile(normal_file_tarinfo, fileobj=file_data)
+
+            info = tarfile.TarInfo("sub/normal_symlink")
+            info.type = tarfile.SYMTYPE
+            info.linkpath = ".." + os.path.sep + "normal_file"
+            tar.addfile(info)
+
+        untar_file(tar_filepath, extract_path)
+
+        assert os.path.islink(os.path.join(extract_path, "sub", "normal_symlink"))
+
+        link_path = os.readlink(os.path.join(extract_path, "sub", "normal_symlink"))
+        assert link_path == ".." + os.path.sep + "normal_file"
+
+        with open(os.path.join(extract_path, "sub", "normal_symlink"), "rb") as f:
+            assert f.read() == b"normal\n"
+
+    def test_unpack_evil_tar_link1_no_data_filter(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
+        """
+        Test unpacking a evil tar with file containing soft links, but no data_filter
+        """
+        if hasattr(tarfile, "data_filter"):
+            monkeypatch.delattr("tarfile.data_filter")
+
+        tar_filename = "test_tar_links_no_data_filter.tar"
+        tar_filepath = os.path.join(self.tempdir, tar_filename)
+
+        import_filename = "import_file"
+        import_filepath = os.path.join(self.tempdir, import_filename)
+        open(import_filepath, "w").close()
+
+        extract_path = os.path.join(self.tempdir, "extract_path")
+
+        with tarfile.open(tar_filepath, "w") as tar:
+            info = tarfile.TarInfo("evil_symlink")
+            info.type = tarfile.SYMTYPE
+            info.linkpath = import_filepath
+            tar.addfile(info)
+
+        with pytest.raises(InstallationError) as e:
+            untar_file(tar_filepath, extract_path)
+
+        msg = (
+            "The tar file ({}) has a file ({}) trying to install outside "
+            "target directory ({})"
+        )
+        assert msg.format(tar_filepath, "evil_symlink", import_filepath) in str(e.value)
+
+        assert not os.path.exists(os.path.join(extract_path, "evil_symlink"))
+
+    def test_unpack_evil_tar_link2_no_data_filter(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
+        """
+        Test unpacking a evil tar with file containing soft links, but no data_filter
+        """
+        if hasattr(tarfile, "data_filter"):
+            monkeypatch.delattr("tarfile.data_filter")
+
+        tar_filename = "test_tar_links_no_data_filter.tar"
+        tar_filepath = os.path.join(self.tempdir, tar_filename)
+
+        import_filename = "import_file"
+        import_filepath = os.path.join(self.tempdir, import_filename)
+        open(import_filepath, "w").close()
+
+        extract_path = os.path.join(self.tempdir, "extract_path")
+
+        link_path = ".." + os.sep + import_filename
+
+        with tarfile.open(tar_filepath, "w") as tar:
+            info = tarfile.TarInfo("evil_symlink")
+            info.type = tarfile.SYMTYPE
+            info.linkpath = link_path
+            tar.addfile(info)
+
+        with pytest.raises(InstallationError) as e:
+            untar_file(tar_filepath, extract_path)
+
+        msg = (
+            "The tar file ({}) has a file ({}) trying to install outside "
+            "target directory ({})"
+        )
+        assert msg.format(tar_filepath, "evil_symlink", link_path) in str(e.value)
+
+        assert not os.path.exists(os.path.join(extract_path, "evil_symlink"))
+
+    def test_unpack_evil_tar_link_chain_no_data_filter(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
+        """
+        Test unpacking an evil tar with a soft link whose target names a member
+        of the archive, but escapes through a previously extracted soft link,
+        with no data_filter
+        """
+        if hasattr(tarfile, "data_filter"):
+            monkeypatch.delattr("tarfile.data_filter")
+
+        tar_filepath = os.path.join(self.tempdir, "test_tar_link_chain.tar")
+        extract_path = os.path.join(self.tempdir, "extract_path")
+
+        # "a/b/up" points to "a", so "a/b/up/../.." resolves to the parent of
+        # the extraction directory, while it normalizes to the member "a".
+        link_path = os.path.join("a", "b", "up", "..", "..")
+        payload = b"pwned\n"
+
+        with tarfile.open(tar_filepath, "w") as tar:
+            for name in ("a", "a/b"):
+                info = tarfile.TarInfo(name)
+                info.type = tarfile.DIRTYPE
+                tar.addfile(info)
+
+            info = tarfile.TarInfo("a/b/up")
+            info.type = tarfile.SYMTYPE
+            info.linkpath = ".."
+            tar.addfile(info)
+
+            info = tarfile.TarInfo("escape")
+            info.type = tarfile.SYMTYPE
+            info.linkpath = link_path
+            tar.addfile(info)
+
+            info = tarfile.TarInfo("escape/pwned")
+            info.size = len(payload)
+            tar.addfile(info, fileobj=io.BytesIO(payload))
+
+        if sys.platform == "win32":
+            # Windows collapses ".." before following symlinks, so the link
+            # may not escape there: extraction is either kept inside the
+            # target directory or rejected.
+            try:
+                untar_file(tar_filepath, extract_path)
+            except InstallationError:
+                pass
+        else:
+            with pytest.raises(InstallationError) as e:
+                untar_file(tar_filepath, extract_path)
+
+            msg = (
+                "The tar file ({}) has a file ({}) trying to install outside "
+                "target directory ({})"
+            )
+            assert msg.format(tar_filepath, "escape", link_path) in str(e.value)
+
+            assert not os.path.lexists(os.path.join(extract_path, "escape"))
+
+        assert not os.path.exists(os.path.join(self.tempdir, "pwned"))
+
+    def test_unpack_evil_tar_link_chain_reordered_no_data_filter(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
+        """
+        Test unpacking an evil tar with a soft link that only escapes once a
+        later soft link is extracted, and a file written through it, with no
+        data_filter
+        """
+        if hasattr(tarfile, "data_filter"):
+            monkeypatch.delattr("tarfile.data_filter")
+
+        tar_filepath = os.path.join(self.tempdir, "test_tar_link_chain.tar")
+        extract_path = os.path.join(self.tempdir, "extract_path")
+
+        payload = b"pwned\n"
+
+        with tarfile.open(tar_filepath, "w") as tar:
+            for name in ("a", "a/b"):
+                info = tarfile.TarInfo(name)
+                info.type = tarfile.DIRTYPE
+                tar.addfile(info)
+
+            info = tarfile.TarInfo("escape")
+            info.type = tarfile.SYMTYPE
+            info.linkpath = os.path.join("a", "b", "up", "..", "..")
+            tar.addfile(info)
+
+            info = tarfile.TarInfo("a/b/up")
+            info.type = tarfile.SYMTYPE
+            info.linkpath = ".."
+            tar.addfile(info)
+
+            info = tarfile.TarInfo("escape/pwned")
+            info.size = len(payload)
+            tar.addfile(info, fileobj=io.BytesIO(payload))
+
+        if sys.platform == "win32":
+            # Windows collapses ".." before following symlinks, so the link
+            # may not escape there: extraction is either kept inside the
+            # target directory or rejected.
+            try:
+                untar_file(tar_filepath, extract_path)
+            except InstallationError:
+                pass
+        else:
+            with pytest.raises(InstallationError) as e:
+                untar_file(tar_filepath, extract_path)
+
+            assert "trying to install outside target directory" in str(e.value)
+
+        assert not os.path.exists(os.path.join(self.tempdir, "pwned"))
+
+    def test_unpack_evil_tar_link_decoy_member_no_data_filter(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
+        """
+        Test unpacking an evil tar with a soft link pointing outside the target
+        directory, to a path that is also used as a member name in the archive,
+        with no data_filter
+        """
+        if hasattr(tarfile, "data_filter"):
+            monkeypatch.delattr("tarfile.data_filter")
+
+        tar_filepath = os.path.join(self.tempdir, "test_tar_link_decoy.tar")
+        extract_path = os.path.join(self.tempdir, "extract_path")
+
+        link_path = self.tempdir
+        payload = b"pwned\n"
+
+        with tarfile.open(tar_filepath, "w") as tar:
+            info = tarfile.TarInfo("escape")
+            info.type = tarfile.SYMTYPE
+            info.linkpath = link_path
+            tar.addfile(info)
+
+            info = tarfile.TarInfo("escape/pwned")
+            info.size = len(payload)
+            tar.addfile(info, fileobj=io.BytesIO(payload))
+
+            # A member named after the link target, so that the target is
+            # "in the archive".
+            info = tarfile.TarInfo(os.path.normpath(link_path).replace("\\", "/"))
+            info.type = tarfile.DIRTYPE
+            tar.addfile(info)
+
+        with pytest.raises(InstallationError) as e:
+            untar_file(tar_filepath, extract_path)
+
+        assert "trying to install outside target directory" in str(e.value)
+
+        assert not os.path.lexists(os.path.join(extract_path, "escape"))
+        assert not os.path.exists(os.path.join(self.tempdir, "pwned"))
 
 
 def test_unpack_tar_unicode(tmpdir: Path) -> None:
